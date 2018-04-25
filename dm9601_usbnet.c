@@ -79,6 +79,13 @@
  *	and expands the device name if you passed a format string to
  *	alloc_netdev.
  */
+/*-------------------------------------------------------------------------
+ *
+ * USB Device Driver support
+ *
+ *-------------------------------------------------------------------------*/
+
+// precondition: never called in_interrupt
 int usbnet_probe (struct usb_interface *udev,		 
 			const struct usb_device_id *prod)
 {
@@ -236,4 +243,75 @@ out1:
 out:
 	return status;
 
+}
+
+/**
+ *	unregister_netdev - remove device from the kernel
+ *	@dev: device
+ *
+ *	This function shuts down a device interface and removes it
+ *	from the kernel tables.
+ *
+ *	This is just a wrapper for unregister_netdevice that takes
+ *	the rtnl semaphore.  In general you want to use this and not
+ *	unregister_netdevice.
+ */
+/**
+ * cancel_work_sync - cancel a work and wait for it to finish
+ * @work: the work to cancel
+ *
+ * Cancel @work and wait for its execution to finish.  This function
+ * can be used even if the work re-queues itself or migrates to
+ * another workqueue.  On return from this function, @work is
+ * guaranteed to be not pending or executing on any CPU.
+ *
+ * cancel_work_sync(&delayed_work->work) must not be used for
+ * delayed_work's.  Use cancel_delayed_work_sync() instead.
+ *
+ * The caller must ensure that the workqueue on which @work was last
+ * queued can't be destroyed before this function returns.
+ *
+ * RETURNS:
+ * %true if @work was pending, %false otherwise.
+ */
+
+/**
+ * usb_scuttle_anchored_urbs - unanchor all an anchor's urbs
+ * @anchor: the anchor whose urbs you want to unanchor
+ *
+ * use this to get rid of all an anchor's urbs
+ */
+
+/*-------------------------------------------------------------------------
+ *
+ * USB NET Disconnect : Only Invoked during Driver remove  
+ *
+ *-------------------------------------------------------------------------*/
+void usbnet_disconnect (struct usb_interface *intf)
+{
+	struct usbnet		*dev;
+	struct usb_device	*xdev;
+	struct net_device	*net;
+	dev = usb_get_intfdata(intf);
+	usb_set_intfdata(intf, NULL);
+	if (!dev)
+		return;
+	xdev = interface_to_usbdev (intf);
+	netif_info(dev, probe, dev->net, "unregister '%s' usb-%s-%s, %s\n",
+		   intf->dev.driver->name,
+		   xdev->bus->bus_name, xdev->devpath,
+		   dev->driver_info->description);
+	net = dev->net;
+	unregister_netdev (net);
+	
+	cancel_work_sync(&dev->kevent);
+	
+	usb_scuttle_anchored_urbs(&dev->deferred);
+	if (dev->driver_info->unbind)
+		dev->driver_info->unbind (dev, intf); //:TODO
+	
+	usb_kill_urb(dev->interrupt);
+	usb_free_urb(dev->interrupt);
+
+	free_netdev(net);
 }
