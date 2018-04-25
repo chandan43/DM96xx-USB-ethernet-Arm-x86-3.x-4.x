@@ -66,7 +66,20 @@
  * Return: Zero on success, or else the status code returned by the
  * underlying usb_control_msg() call.
  */
-int usbnet_probe (truct usb_interface *udev,		 
+/**
+ *	register_netdev	- register a network device
+ *	@dev: device to register
+ *
+ *	Take a completed network device structure and add it to the kernel
+ *	interfaces. A %NETDEV_REGISTER message is sent to the netdev notifier
+ *	chain. 0 is returned on success. A negative errno code is returned
+ *	on a failure to set up the device, or if the name is a duplicate.
+ *
+ *	This is a wrapper around register_netdevice that takes the rtnl semaphore
+ *	and expands the device name if you passed a format string to
+ *	alloc_netdev.
+ */
+int usbnet_probe (struct usb_interface *udev,		 
 			const struct usb_device_id *prod)
 {
 	struct usbnet			*dev;
@@ -172,7 +185,7 @@ int usbnet_probe (truct usb_interface *udev,
 		if (net->mtu > (dev->hard_mtu - net->hard_header_len))
 			net->mtu = dev->hard_mtu - net->hard_header_len;	
 	}else if (!info->in || !info->out)
-		status = usbnet_get_endpoints (dev, udev);
+		status = usbnet_get_endpoints (dev, udev); //TODO
 	else {
 		dev->in = usb_rcvbulkpipe (xdev, info->in);
 		dev->out = usb_sndbulkpipe (xdev, info->out);
@@ -184,5 +197,43 @@ int usbnet_probe (truct usb_interface *udev,
 			status = 0;
 	}
 	//TODO:::
-			
+	if(status >= 0 && dev->status)
+		status = init_status (dev,udev); //TODO: 
+	if (status < 0)
+		goto out3;
+	if(!dev->rx_urb_size)
+		dev->rx_urb_size = dev->hard_mtu;
+	dev->maxpacket =  usb_maxpacket (dev->udev, dev->out, 1);
+	if ((dev->driver_info->flags & FLAG_WLAN) != 0)
+		SET_NETDEV_DEVTYPE(net, &wlan_type);
+	if ((dev->driver_info->flags & FLAG_WWAN) != 0)
+		SET_NETDEV_DEVTYPE(net, &wwan_type);
+
+	status = register_netdev (net);
+	if (status)
+		goto out4;
+	netif_info(dev, probe, dev->net,
+		   "register '%s' at usb-%s-%s, %s, %pM\n",
+		   udev->dev.driver->name,
+		   xdev->bus->bus_name, xdev->devpath,
+		   dev->driver_info->description,
+		   net->dev_addr);
+	/* ok, it's ready to go.*/
+	usb_set_intfdata (udev, dev);
+	
+	netif_device_attach (net);
+
+	if (dev->driver_info->flags & FLAG_LINK_INTR)
+		usbnet_link_change(dev, 0, 0);
+	return 0;
+out4:
+	usb_free_urb(dev->interrupt);
+out3:
+	if (info->unbind)
+		info->unbind (dev, udev);
+out1:
+	free_netdev(net);
+out:
+	return status;
+
 }
