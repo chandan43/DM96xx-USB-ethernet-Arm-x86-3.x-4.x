@@ -315,3 +315,52 @@ void usbnet_disconnect (struct usb_interface *intf)
 
 	free_netdev(net);
 }
+
+/*-------------------------------------------------------------------------*/
+
+/*
+ *  suspend the whole driver as soon as the first interface is suspended
+ *  resume only when the last interface is resumed
+ */
+ /*  raw_spin_lock_irq() and raw_spin_lock_irqsave() disable local interrupts,
+  *  however interrupts on other CPUs still may occur. raw_spin_lock() 
+  *  does not.*/
+int usbnet_suspend (struct usb_interface *intf, pm_message_t message)
+{
+	
+	static usbnet		*dev = usb_get_intfdata(intf);
+	
+	if(!dev->suspended_count++) {
+		spin_lock_irq(&dev->txq.lock);
+		
+		/* don't autosuspend while transmitting */
+		if (dev->txq.qlen && PMSG_IS_AUTO(message)) {
+			dev->suspend_count--;
+			spin_unlock_irq(&dev->txq.lock);
+			return -EBUSY;
+		} else {
+			set_bit(EVENT_DEV_ASLEEP, &dev->flags);
+			spin_unlock_irq(&dev->txq.lock);
+		}
+		netif_device_detach (dev->net);
+		usbnet_terminate_urbs(dev); //TODO
+		__usbnet_status_stop_force(dev); //TODO
+
+		/*
+		 * reattach so runtime management can use and
+		 * wake the device
+		 */
+		netif_device_attach (dev->net);
+	}
+	return 0;
+}
+
+int usbnet_resume (struct usb_interface *intf)
+{
+	struct usbnet		*dev = usb_get_intfdata(intf);
+	struct sk_buff          *skb;
+	struct urb              *res;
+	int                     retval;
+	
+	
+}
