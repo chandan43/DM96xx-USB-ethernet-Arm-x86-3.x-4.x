@@ -13,6 +13,55 @@
 #include <linux/pm_runtime.h>
 
 /*-------------------------------------------------------------------------*/
+/* work that cannot be done in interrupt context uses keventd.
+ *
+ * NOTE:  with 2.5 we could do more of this using completion callbacks,
+ * especially now that control transfers can be queued.
+ */
+
+/**
+ * usb_clear_halt - tells device to clear endpoint halt/stall condition
+ * @dev: device whose endpoint is halted
+ * @pipe: endpoint "pipe" being cleared
+ * Context: !in_interrupt ()
+ *
+ * This is used to clear halt conditions for bulk and interrupt endpoints,
+ * as reported by URB completion status.  Endpoints that are halted are
+ * sometimes referred to as being "stalled".  Such endpoints are unable
+ * to transmit or receive data until the halt status is cleared.  Any URBs
+ * queued for such an endpoint should normally be unlinked by the driver
+ * before clearing the halt condition, as described in sections 5.7.5
+ * and 5.8.5 of the USB 2.0 spec.
+ *
+ * Note that control and isochronous endpoints don't halt, although control
+ * endpoints report "protocol stall" (for unsupported requests) using the
+ * same status code used to report a true stall.
+ *
+ * This call is synchronous, and may not be used in an interrupt context.
+ *
+ * Return: Zero on success, or else the status code returned by the
+ * underlying usb_control_msg() call.
+ */
+static void
+kevent (struct work_struct *work)
+{
+	struct usbnet	*dev = 
+		container_of(work, struct usbnet, kevent);
+	int status;
+	/* usb_clear_halt() needs a thread context */
+	if (test_bit (EVENT_TX_HALT, &dev->flags)) {
+		unlink_urbs (dev, &dev->txq);
+		status = usb_autopm_get_interface(dev->intf);
+		if(status < 0)
+			goto fail_pipe;
+		status = usb_clear_halt (dev->udev, dev->out);
+		usb_autopm_put_interface(dev->intf); 
+	}
+
+}  
+
+
+/*-------------------------------------------------------------------------*/
 /**
  * mod_timer - modify a timer's timeout
  * @timer: the timer to be modified
