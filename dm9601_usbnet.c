@@ -13,6 +13,358 @@
 #include <linux/pm_runtime.h>
 
 /*-------------------------------------------------------------------------*/
+
+/**
+ * schedule_timeout - sleep until timeout
+ * @timeout: timeout value in jiffies
+ *
+ * Make the current task sleep until @timeout jiffies have
+ * elapsed. The routine will return immediately unless
+ * the current task state has been set (see set_current_state()).
+ *
+ * You can set the task state as follows -
+ *
+ * %TASK_UNINTERRUPTIBLE - at least @timeout jiffies are guaranteed to
+ * pass before the routine returns. The routine will return 0
+ *
+ * %TASK_INTERRUPTIBLE - the routine may return early if a signal is
+ * delivered to the current task. In this case the remaining time
+ * in jiffies will be returned, or 0 if the timer expired in time
+ *
+ * The current task state is guaranteed to be TASK_RUNNING when this
+ * routine returns.
+ *
+ * Specifying a @timeout value of %MAX_SCHEDULE_TIMEOUT will schedule
+ * the CPU away without a bound on the timeout. In this case the return
+ * value will be %MAX_SCHEDULE_TIMEOUT.
+ *
+ * In all cases the return value is guaranteed to be non-negative.
+ */
+// precondition: never called in_interrupt
+static void usbnet_terminate_urbs(struct usbnet *dev)
+{
+	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(unlink_wakeup);
+	DECLARE_WAITQUEUE(wait, current);
+	int temp;
+	
+	/* ensure there are no more active urbs */
+	add_wait_queue(&unlink_wakeup, &wait);
+	set_current_state(TASK_UNINTERRUPTIBLE);
+	dev->wait = &unlink_wakeup;	
+	temp = unlink_urbs(dev, &dev->txq) +
+		unlink_urbs(dev, &dev->rxq);
+	/* maybe wait for deletions to finish. */
+	/* maybe wait for deletions to finish. */
+	while (!skb_queue_empty(&dev->rxq)
+		&& !skb_queue_empty(&dev->txq)
+		&& !skb_queue_empty(&dev->done)) {
+			schedule_timeout(msecs_to_jiffies(UNLINK_TIMEOUT_MS));
+			set_current_state(TASK_UNINTERRUPTIBLE);
+			netif_dbg(dev, ifdown, dev->net,
+				  "waited for %d urb completions\n", temp);
+	}
+	set_current_state(TASK_RUNNING);
+	dev->wait = NULL;
+	remove_wait_queue(&unlink_wakeup, &wait);
+}
+int usbnet_stop (struct net_device *net)
+{
+	struct usbnet		*dev = netdev_priv(net);
+	struct driver_info	*info = dev->driver_info;
+	int			retval;
+
+	clear_bit(EVENT_DEV_OPEN, &dev->flags);
+	netif_stop_queue (net);
+	
+	netif_info(dev, ifdown, dev->net,
+		   "stop stats: rx/tx %lu/%lu, errs %lu/%lu\n",
+		   net->stats.rx_packets, net->stats.tx_packets,
+		   net->stats.rx_errors, net->stats.tx_errors);
+
+	/* allow minidriver to stop correctly (wireless devices to turn off
+	 * radio etc) */
+	if (info->stop) {
+		retval = info->stop(dev);
+		if (retval < 0)
+			netif_info(dev, ifdown, dev->net,
+				   "stop fail (%d) usbnet usb-%s-%s, %s\n",
+				   retval,
+				   dev->udev->bus->bus_name, dev->udev->devpath,
+				   info->description);
+	}
+	
+	if (!(info->flags & FLAG_AVOID_UNLINK_URBS))
+		usbnet_terminate_urbs(dev); //TODO
+
+	usbnet_status_stop(dev); //TODO
+
+	usbnet_purge_paused_rxq(dev); //TODO
+	
+	/* deferred work (task, timer, softirq) must also stop.
+	 * can't flush_scheduled_work() until we drop rtnl (later),
+	 * else workers could deadlock; so make workers a NOP.
+	 */
+	dev->flags = 0;
+	del_timer_sync (&dev->delay);
+	tasklet_kill (&dev->bh);
+	if (info->manage_power &&
+	    !test_and_clear_bit(EVENT_NO_RUNTIME_PM, &dev->flags))
+		info->manage_power(dev, 0);
+	else
+		usb_autopm_put_interface(dev->intf);
+
+	return 0;
+			
+}
+
+EXPORT_SYMBOL_GPL(usbnet_stop);
+/*-------------------------------------------------------------------------*/
+
+// posts reads, and enables write queuing
+
+// precondition: never called in_interrupt
+
+int usbnet_open (struct net_device *net)
+{
+	struct usbnet		*dev = netdev_priv(net);
+	int			retval;
+	struct driver_info	*info = dev->driver_info;
+
+	
+	if ((retval = usb_autopm_get_interface(dev->intf)) < 0) {
+		netif_info(dev, ifup, dev->net,
+			   "resumption fail (%d) usbnet usb-%s-%s, %s\n",
+			   retval,
+			   dev->udev->bus->bus_name,
+			   dev->udev->devpath,
+			   info->description);
+		goto done_nopm;
+	}
+	// put into "known safe" state
+	if (info->reset && (retval = info->reset (dev)) < 0) {
+		netif_info(dev, ifup, dev->net,
+			   "open reset fail (%d) usbnet usb-%s-%s, %s\n",
+			   retval,
+			   dev->udev->bus->bus_name,
+			   dev->udev->devpath,
+			   info->description);
+		goto done;
+	}
+	// insist peer be connected
+	if (info->check_connect && (retval = info->check_connect (dev)) < 0) {
+		netif_dbg(dev, ifup, dev->net, "can't open; %d\n", retval);
+		goto done;
+	}
+	/* start any status interrupt transfer */
+	if (dev->interrupt) {
+		retval = usbnet_status_start(dev, GFP_KERNEL); //TODO
+		if (retval < 0) {
+			netif_err(dev, ifup, dev->net,
+				  "intr submit %d\n", retval);
+			goto done;
+		}
+	}
+	
+	set_bit(EVENT_DEV_OPEN, &dev->flags);
+	netif_start_queue (net);
+	netif_info(dev, ifup, dev->net,
+		   "open: enable queueing (rx %d, tx %d) mtu %d %s framing\n",
+		   (int)RX_QLEN(dev), (int)TX_QLEN(dev),
+		   dev->net->mtu,
+		   (dev->driver_info->flags & FLAG_FRAMING_NC) ? "NetChip" :
+		   (dev->driver_info->flags & FLAG_FRAMING_GL) ? "GeneSys" :
+		   (dev->driver_info->flags & FLAG_FRAMING_Z) ? "Zaurus" :
+		   (dev->driver_info->flags & FLAG_FRAMING_RN) ? "RNDIS" :
+		   (dev->driver_info->flags & FLAG_FRAMING_AX) ? "ASIX" :
+		   "simple");	
+	/* reset rx error state */
+	dev->pkt_cnt = 0;
+	dev->pkt_err = 0;
+	clear_bit(EVENT_RX_KILL, &dev->flags);
+	// delay posting reads until we're fully open
+	tasklet_schedule (&dev->bh);
+	if (info->manage_power) {
+		retval = info->manage_power(dev, 1);
+		if (retval < 0) {
+			retval = 0;
+			set_bit(EVENT_NO_RUNTIME_PM, &dev->flags);
+		} else {
+			usb_autopm_put_interface(dev->intf);
+		}
+	}
+	return retval;	
+done:
+	usb_autopm_put_interface(dev->intf);
+done_nopm:
+	return retval;
+}
+/*-------------------------------------------------------------------------*/
+
+/* ethtool methods; minidrivers may need to add some more, but
+ * they'll probably want to use this base set.
+ */
+
+/**
+ * mii_ethtool_gset - get settings that are specified in @ecmd
+ * @mii: MII interface
+ * @ecmd: requested ethtool_cmd
+ *
+ * The @ecmd parameter is expected to have been cleared before calling
+ * mii_ethtool_gset().
+ *
+ * Returns 0 for success, negative on error.
+ */
+int usbnet_get_settings (struct net_device *net, struct ethtool_cmd *cmd)
+{
+	struct usbnet *dev = netdev_priv(net);
+
+	if (!dev->mii.mdio_read)
+		return -EOPNOTSUPP;
+
+	return mii_ethtool_gset(&dev->mii, cmd);
+}
+EXPORT_SYMBOL_GPL(usbnet_get_settings);
+
+/**
+ * mii_ethtool_sset - set settings that are specified in @ecmd
+ * @mii: MII interface
+ * @ecmd: requested ethtool_cmd
+ *
+ * Returns 0 for success, negative on error.
+ */
+int usbnet_set_settings (struct net_device *net, struct ethtool_cmd *cmd)
+{
+	struct usbnet *dev = netdev_priv(net);
+	int retval;
+
+	if (!dev->mii.mdio_write)
+		return -EOPNOTSUPP;
+
+	retval = mii_ethtool_sset(&dev->mii, cmd);
+
+	/* link speed/duplex might have changed */
+	if (dev->driver_info->link_reset)
+		dev->driver_info->link_reset(dev);
+
+	return retval;
+
+}
+EXPORT_SYMBOL_GPL(usbnet_set_settings);
+
+u32 usbnet_get_link (struct net_device *net)
+{
+	struct usbnet *dev = netdev_priv(net);
+
+	/* If a check_connect is defined, return its result */
+	if (dev->driver_info->check_connect)
+		return dev->driver_info->check_connect (dev) == 0;
+
+	/* if the device has mii operations, use those */
+	if (dev->mii.mdio_read)
+		return mii_link_ok(&dev->mii);
+
+	/* Otherwise, dtrt for drivers calling netif_carrier_{on,off} */
+	return ethtool_op_get_link(net);
+}
+EXPORT_SYMBOL_GPL(usbnet_get_link);
+
+int usbnet_nway_reset(struct net_device *net)
+{
+	struct usbnet *dev = netdev_priv(net);
+
+	if (!dev->mii.mdio_write)
+		return -EOPNOTSUPP;
+
+	return mii_nway_restart(&dev->mii);
+}
+EXPORT_SYMBOL_GPL(usbnet_nway_reset);
+
+/**
+ * usb_make_path - returns stable device path in the usb tree
+ * @dev: the device whose path is being constructed
+ * @buf: where to put the string
+ * @size: how big is "buf"?
+ *
+ * Return: Length of the string (> 0) or negative if size was too small.
+ *
+ * Note:
+ * This identifier is intended to be "stable", reflecting physical paths in
+ * hardware such as physical bus addresses for host controllers or ports on
+ * USB hubs.  That makes it stay the same until systems are physically
+ * reconfigured, by re-cabling a tree of USB devices or by moving USB host
+ * controllers.  Adding and removing devices, including virtual root hubs
+ * in host controller driver modules, does not change these path identifiers;
+ * neither does rebooting or re-enumerating.  These are more useful identifiers
+ * than changeable ("unstable") ones like bus numbers or device addresses.
+ *
+ * With a partial exception for devices connected to USB 2.0 root hubs, these
+ * identifiers are also predictable.  So long as the device tree isn't changed,
+ * plugging any USB device into a given hub port always gives it the same path.
+ * Because of the use of "companion" controllers, devices connected to ports on
+ * USB 2.0 root hubs (EHCI host controllers) will get one path ID if they are
+ * high speed, and a different one if they are full or low speed.
+ */
+void usbnet_get_drvinfo (struct net_device *net, struct ethtool_drvinfo *info)
+{
+	struct usbnet *dev = netdev_priv(net);
+
+	strlcpy (info->driver, dev->driver_name, sizeof info->driver);
+	strlcpy (info->version, DRIVER_VERSION, sizeof info->version);
+	strlcpy (info->fw_version, dev->driver_info->description,
+		sizeof info->fw_version);
+	usb_make_path (dev->udev, info->bus_info, sizeof info->bus_info);
+}
+EXPORT_SYMBOL_GPL(usbnet_get_drvinfo);
+
+u32 usbnet_get_msglevel (struct net_device *net)
+{
+	struct usbnet *dev = netdev_priv(net);
+
+	return dev->msg_enable;
+}
+EXPORT_SYMBOL_GPL(usbnet_get_msglevel);
+
+void usbnet_set_msglevel (struct net_device *net, u32 level)
+{
+	struct usbnet *dev = netdev_priv(net);
+
+	dev->msg_enable = level;
+}
+EXPORT_SYMBOL_GPL(usbnet_set_msglevel);
+
+/* drivers may override default ethtool_ops in their bind() routine */
+static const struct ethtool_ops usbnet_ethtool_ops = {
+	.get_settings		= usbnet_get_settings,
+	.set_settings		= usbnet_set_settings,
+	.get_link		= usbnet_get_link,
+	.nway_reset		= usbnet_nway_reset,
+	.get_drvinfo		= usbnet_get_drvinfo,
+	.get_msglevel		= usbnet_get_msglevel,
+	.set_msglevel		= usbnet_set_msglevel,
+	.get_ts_info		= ethtool_op_get_ts_info,
+};
+
+/*-------------------------------------------------------------------------*/
+static void __handle_link_change(struct usbnet *dev)
+{
+	if (!test_bit(EVENT_DEV_OPEN, &dev->flags))
+		return;
+	if (!netif_carrier_ok(dev->net)) {
+		/* kill URBs for reading packets to save bus bandwidth */
+		unlink_urbs(dev, &dev->rxq);
+		
+		/*
+		 * tx_timeout will unlink URBs for sending packets and
+		 * tx queue is stopped by netcore after link becomes off
+		 */
+	}else {
+		/* submitting URBs for reading packets */
+		tasklet_schedule(&dev->bh);
+	}
+	clear_bit(EVENT_LINK_CHANGE, &dev->flags);		
+}
+
+/*-------------------------------------------------------------------------*/
 /* work that cannot be done in interrupt context uses keventd.
  *
  * NOTE:  with 2.5 we could do more of this using completion callbacks,
