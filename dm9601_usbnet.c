@@ -13,6 +13,146 @@
 #include <linux/pm_runtime.h>
 
 /*-------------------------------------------------------------------------*/
+void usbnet_pause_rx(struct usbnet *dev)
+{
+	set_bit(EVENT_RX_PAUSED, &dev->flags);
+
+	netif_dbg(dev, rx_status, dev->net, "paused rx queue enabled\n");
+}
+EXPORT_SYMBOL_GPL(usbnet_pause_rx);
+
+/**
+ *	skb_dequeue - remove from the head of the queue
+ *	@list: list to dequeue from
+ *
+ *	Remove the head of the list. The list lock is taken so the function
+ *	may be used safely with other locking list functions. The head item is
+ *	returned or %NULL if the list is empty.
+ */
+
+void usbnet_resume_rx(struct usbnet *dev)
+{
+	struct sk_buff *skb;
+	int num = 0;
+
+	clear_bit(EVENT_RX_PAUSED, &dev->flags);
+
+	while ((skb = skb_dequeue(&dev->rxq_pause)) != NULL) {
+		usbnet_skb_return(dev, skb);
+		num++;
+	}
+
+	tasklet_schedule(&dev->bh);
+
+	netif_dbg(dev, rx_status, dev->net,
+		  "paused rx queue disabled, %d skbs requeued\n", num);
+}
+EXPORT_SYMBOL_GPL(usbnet_resume_rx);
+
+/**
+ *	skb_queue_purge - empty a list
+ *	@list: list to empty
+ *
+ *	Delete all buffers on an &sk_buff list. Each buffer is removed from
+ *	the list and one reference dropped. This function takes the list
+ *	lock and is atomic with respect to other list locking functions.
+ */
+
+void usbnet_purge_paused_rxq(struct usbnet *dev)
+{
+	skb_queue_purge(&dev->rxq_pause);
+}
+EXPORT_SYMBOL_GPL(usbnet_purge_paused_rxq);
+/*-------------------------------------------------------------------------*/
+/*
+ * If lockdep is enabled then we use the non-preemption spin-ops
+ * even on CONFIG_PREEMPT, because lockdep assumes that interrupts are
+ * not re-enabled during lock-acquire (which the preempt-spin-ops do):
+ */
+ 
+
+/*spin_lock_irqsave is basically used to save the interrupt state before taking the spin lock,
+ this is because spin lock disables the interrupt, when the lock is taken in interrupt context, 
+ and re-enables it when while unlocking. The interrupt state is saved so that it should reinstate 
+ the interrupts again.
+
+Example:
+    Lets say interrupt x was disabled before spin lock was acquired
+    spin_lock_irq will disable the interrupt x and take the the lock
+    spin_unlock_irq will enable the interrupt x.
+
+So in the 3rd step above after releasing the lock we will have interrupt x enabled which was 
+earlier disabled before the lock was acquired.
+
+So only when you are sure that interrupts are not disabled only then you should spin_lock_irq 
+otherwise you should always use spin_lock_irqsave.
+*/
+
+/**
+ *	skb_queue_empty - check if a queue is empty
+ *	@list: queue head
+ *
+ *	Returns true if the queue is empty, false otherwise.
+ */
+// unlink pending rx/tx; completion handlers do all other cleanup
+
+static int unlink_urbs (struct usbnet *dev, struct sk_buff_head *q)
+{
+	unsigned long		flags;
+	struct sk_buff		*skb;
+	int			count = 0;
+	
+	spin_lock_irqsave (&q->lock, flags); // save the state, if locked already it is saved in flags
+	while (!skb_queue_empty(q)) {
+		struct skb_data		*entry;
+		struct urb		*urb;
+		int			retval;
+
+		skb_queue_walk(q, skb) {
+			entry = (struct skb_data *) skb->cb;
+			if (entry->state != unlink_start)
+				goto found;
+		}
+		break;
+found:
+		entry->state = unlink_start;
+		urb = entry->urb;
+
+		/*
+		 * Get reference count of the URB to avoid it to be
+		 * freed during usb_unlink_urb, which may trigger
+		 * use-after-free problem inside usb_unlink_urb since
+		 * usb_unlink_urb is always racing with .complete
+		 * handler(include defer_bh).
+		 */
+		usb_get_urb(urb);
+		spin_unlock_irqrestore(&q->lock, flags);
+		// during some PM-driven resume scenarios,
+		// these (async) unlinks complete immediately
+		retval = usb_unlink_urb (urb);
+		if (retval != -EINPROGRESS && retval != 0)
+			netdev_dbg(dev->net, "unlink urb err, %d\n", retval);
+		else
+			count++;
+		usb_put_urb(urb);
+		spin_lock_irqsave(&q->lock, flags);
+	}
+	spin_unlock_irqrestore (&q->lock, flags);
+	return count;
+}
+// Flush all pending rx urbs
+// minidrivers may need to do this when the MTU changes
+
+void usbnet_unlink_rx_urbs(struct usbnet *dev)
+{
+	if (netif_running(dev->net)) {
+		(void) unlink_urbs (dev, &dev->rxq);
+		tasklet_schedule(&dev->bh);
+	}
+}
+EXPORT_SYMBOL_GPL(usbnet_unlink_rx_urbs);
+
+/*-------------------------------------------------------------------------*/
 
 /**
  * schedule_timeout - sleep until timeout
