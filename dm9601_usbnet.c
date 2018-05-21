@@ -12,6 +12,390 @@
 #include <linux/kernel.h>
 #include <linux/pm_runtime.h>
 
+/*-------------------------------------------------------------------------*/
+
+/*
+ * Nineteen USB 1.1 max size bulk transactions per frame (ms), max.
+ * Several dozen bytes of IPv4 data can fit in two such transactions.
+ * One maximum size Ethernet packet takes twenty four of them.
+ * For high speed, each frame comfortably fits almost 36 max size
+ * Ethernet packets (so queues should be bigger).
+ *
+ * REVISIT qlens should be members of 'struct usbnet'; the goal is to
+ * let the USB host controller be busy for 5msec or more before an irq
+ * is required, under load.  Jumbograms change the equation.
+ */
+#define RX_MAX_QUEUE_MEMORY (60 * 1518)
+#define	RX_QLEN(dev) (((dev)->udev->speed == USB_SPEED_HIGH) ? \
+			(RX_MAX_QUEUE_MEMORY/(dev)->rx_urb_size) : 4)
+#define	TX_QLEN(dev) (((dev)->udev->speed == USB_SPEED_HIGH) ? \
+			(RX_MAX_QUEUE_MEMORY/(dev)->hard_mtu) : 4)
+
+// reawaken network queue this soon after stopping; else watchdog barks
+#define TX_TIMEOUT_JIFFIES	(5*HZ)
+
+// throttle rx/tx briefly after some faults, so khubd might disconnect()
+// us (it polls at HZ/4 usually) before we report too many false errors.
+#define THROTTLE_JIFFIES	(HZ/8)
+
+// between wakeups
+#define UNLINK_TIMEOUT_MS	3
+
+
+/*-------------------------------------------------------------------------*/
+
+// randomly generated ethernet address
+static u8	node_id [ETH_ALEN];
+
+static const char driver_name [] = "usbnet";
+
+/* use ethtool to change the level for any given device */
+static int msg_level = -1;
+module_param (msg_level, int, 0);
+MODULE_PARM_DESC (msg_level, "Override default message level");
+
+/*-------------------------------------------------------------------------*/
+/**
+ * usb_set_interface - Makes a particular alternate setting be current
+ * @dev: the device whose interface is being updated
+ * @interface: the interface being updated
+ * @alternate: the setting being chosen.
+ * Context: !in_interrupt ()
+ */
+/* handles CDC Ethernet and many other network "bulk data" interfaces */
+int usbnet_get_endpoints(struct usbnet *dev, struct usb_interface *intf)
+{
+	int				tmp;
+	struct usb_host_interface	*alt = NULL;
+	struct usb_host_endpoint	*in = NULL, *out = NULL;
+	struct usb_host_endpoint	*status = NULL;
+
+	for (tmp = 0; tmp < intf->num_altsetting; tmp++) {
+		unsigned	ep;
+
+		in = out = status = NULL;
+		alt = intf->altsetting + tmp;
+		
+		/* take the first altsetting with in-bulk + out-bulk;
+		 * remember any status endpoint, just in case;
+		 * ignore other endpoints and altsettings.
+		 */
+		for (ep = 0; ep < alt->desc.bNumEndpoints; ep++) {
+			struct usb_host_endpoint	*e;
+			int				intr = 0;
+
+			e = alt->endpoint + ep;
+			switch (e->desc.bmAttributes) {
+			case USB_ENDPOINT_XFER_INT:
+				if (!usb_endpoint_dir_in(&e->desc))
+					continue;
+				intr = 1;
+				/* FALLTHROUGH */
+			case USB_ENDPOINT_XFER_BULK:
+				break;
+			default:
+				continue;
+			}
+			if (usb_endpoint_dir_in(&e->desc)) {
+				if (!intr && !in)
+					in = e;
+				else if (intr && !status)
+					status = e;
+			} else {
+				if (!out)
+					out = e;
+			}
+		}
+		if (in && out)
+			break;
+	}
+	if (!alt || !in || !out)
+		return -EINVAL;	
+	if (alt->desc.bAlternateSetting != 0 ||
+	    !(dev->driver_info->flags & FLAG_NO_SETINT)) {
+		tmp = usb_set_interface (dev->udev, alt->desc.bInterfaceNumber,
+				alt->desc.bAlternateSetting);
+		if (tmp < 0)
+			return tmp;
+	}
+	dev->in = usb_rcvbulkpipe (dev->udev,
+			in->desc.bEndpointAddress & USB_ENDPOINT_NUMBER_MASK);
+	dev->out = usb_sndbulkpipe (dev->udev,
+			out->desc.bEndpointAddress & USB_ENDPOINT_NUMBER_MASK);
+	dev->status = status;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(usbnet_get_endpoints);
+
+int usbnet_get_ethernet_addr(struct usbnet *dev, int iMACAddress)
+{
+	int 		tmp, i;
+	unsigned char	buf [13];
+
+	tmp = usb_string(dev->udev, iMACAddress, buf, sizeof buf);
+	if (tmp != 12) {
+		dev_dbg(&dev->udev->dev,
+			"bad MAC string %d fetch, %d\n", iMACAddress, tmp);
+		if (tmp >= 0)
+			tmp = -EINVAL;
+		return tmp;
+	}
+	for (i = tmp = 0; i < 6; i++, tmp += 2)
+		dev->net->dev_addr [i] =
+			(hex_to_bin(buf[tmp]) << 4) + hex_to_bin(buf[tmp + 1]);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(usbnet_get_ethernet_addr);
+
+static void intr_complete (struct urb *urb)
+{
+	struct usbnet	*dev = urb->context;
+	int		status = urb->status;
+
+	switch (status) {
+	/* success */
+	case 0:
+		dev->driver_info->status(dev, urb);
+		break;
+
+	/* software-driven interface shutdown */
+	case -ENOENT:		/* urb killed */
+	case -ESHUTDOWN:	/* hardware gone */
+		netif_dbg(dev, ifdown, dev->net,
+			  "intr shutdown, code %d\n", status);
+		return;
+
+	/* NOTE:  not throttling like RX/TX, since this endpoint
+	 * already polls infrequently
+	 */
+	default:
+		netdev_dbg(dev->net, "intr status %d\n", status);
+		break;
+	}
+
+	if (!netif_running (dev->net))
+		return;
+
+	status = usb_submit_urb (urb, GFP_ATOMIC);
+	if (status != 0)
+		netif_err(dev, timer, dev->net,
+			  "intr resubmit --> %d\n", status);
+}
+
+static int init_status (struct usbnet *dev, struct usb_interface *intf)
+{
+	char		*buf = NULL;
+	unsigned	pipe = 0;
+	unsigned	maxp;
+	unsigned	period;
+
+	if (!dev->driver_info->status)
+		return 0;
+	pipe = usb_rcvintpipe (dev->udev,
+			dev->status->desc.bEndpointAddress
+				& USB_ENDPOINT_NUMBER_MASK);
+	maxp = usb_maxpacket (dev->udev, pipe, 0);
+	/* avoid 1 msec chatter:  min 8 msec poll rate */
+	period = max ((int) dev->status->desc.bInterval,
+		(dev->udev->speed == USB_SPEED_HIGH) ? 7 : 3);
+	buf = kmalloc (maxp, GFP_KERNEL);
+	if (buf) {
+		dev->interrupt = usb_alloc_urb (0, GFP_KERNEL);
+		if (!dev->interrupt) {
+			kfree (buf);
+			return -ENOMEM;
+		} else {
+			usb_fill_int_urb(dev->interrupt, dev->udev, pipe,
+				buf, maxp, intr_complete, dev, period);
+			dev->interrupt->transfer_flags |= URB_FREE_BUFFER;
+			dev_dbg(&intf->dev,
+				"status ep%din, %d bytes period %d\n",
+				usb_pipeendpoint(pipe), maxp, period);
+		}
+	}
+	return 0;	
+}
+
+/* Submit the interrupt URB if not previously submitted, increasing refcount */
+int usbnet_status_start(struct usbnet *dev, gfp_t mem_flags)
+{
+	int ret = 0;
+
+	WARN_ON_ONCE(dev->interrupt == NULL);
+	if (dev->interrupt) {
+		mutex_lock(&dev->interrupt_mutex);
+
+		if (++dev->interrupt_count == 1)
+			ret = usb_submit_urb(dev->interrupt, mem_flags);
+
+		dev_dbg(&dev->udev->dev, "incremented interrupt URB count to %d\n",
+			dev->interrupt_count);
+		mutex_unlock(&dev->interrupt_mutex);
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(usbnet_status_start);
+
+/* For resume; submit interrupt URB if previously submitted */
+static int __usbnet_status_start_force(struct usbnet *dev, gfp_t mem_flags)
+{
+	int ret = 0;
+
+	mutex_lock(&dev->interrupt_mutex);
+	if (dev->interrupt_count) {
+		ret = usb_submit_urb(dev->interrupt, mem_flags);
+		dev_dbg(&dev->udev->dev,
+			"submitted interrupt URB for resume\n");
+	}
+	mutex_unlock(&dev->interrupt_mutex);
+	return ret;
+}
+
+/* Kill the interrupt URB if all submitters want it killed */
+void usbnet_status_stop(struct usbnet *dev)
+{
+	if (dev->interrupt) {
+		mutex_lock(&dev->interrupt_mutex);
+		WARN_ON(dev->interrupt_count == 0);
+
+		if (dev->interrupt_count && --dev->interrupt_count == 0)
+			usb_kill_urb(dev->interrupt);
+
+		dev_dbg(&dev->udev->dev,
+			"decremented interrupt URB count to %d\n",
+			dev->interrupt_count);
+		mutex_unlock(&dev->interrupt_mutex);
+	}
+}
+
+/* For suspend; always kill interrupt URB */
+static void __usbnet_status_stop_force(struct usbnet *dev)
+{
+	if (dev->interrupt) {
+		mutex_lock(&dev->interrupt_mutex);
+		usb_kill_urb(dev->interrupt);
+		dev_dbg(&dev->udev->dev, "killed interrupt URB for suspend\n");
+		mutex_unlock(&dev->interrupt_mutex);
+	}
+}
+/*-------------------------------------------------------------------------*/
+/**
+ * eth_type_trans - determine the packet's protocol ID.
+ * @skb: received socket data
+ * @dev: receiving network device
+ *
+ * The rule here is that we
+ * assume 802.3 if the type field is short enough to be a length.
+ * This is normal practice and works for any 'now in use' protocol.
+ */
+/**
+ *	netif_rx	-	post buffer to the network code
+ *	@skb: buffer to post
+ *
+ *	This function receives a packet from a device driver and queues it for
+ *	the upper (protocol) levels to process.  It always succeeds. The buffer
+ *	may be dropped during processing for congestion control or by the
+ *	protocol layers.
+ *
+ *	return values:
+ *	NET_RX_SUCCESS	(no congestion)
+ *	NET_RX_DROP     (packet was dropped)
+ *
+ */
+/* Passes this packet up the stack, updating its accounting.
+ * Some link protocols batch packets, so their rx_fixup paths
+ * can return clones as well as just modify the original skb.
+ */
+void usbnet_skb_return (struct usbnet *dev, struct sk_buff *skb)
+{
+	int	status;
+
+	if (test_bit(EVENT_RX_PAUSED, &dev->flags)) {
+		skb_queue_tail(&dev->rxq_pause, skb);
+		return;
+	}
+	skb->protocol = eth_type_trans (skb, dev->net);
+	dev->net->stats.rx_packets++;
+	dev->net->stats.rx_bytes += skb->len;
+	netif_dbg(dev, rx_status, dev->net, "< rx, len %zu, type 0x%x\n",
+		  skb->len + sizeof (struct ethhdr), skb->protocol);
+	memset (skb->cb, 0, sizeof (struct skb_data));
+
+	if (skb_defer_rx_timestamp(skb))
+		return;
+	status = netif_rx (skb);
+	if (status != NET_RX_SUCCESS)
+		netif_dbg(dev, rx_err, dev->net,
+			  "netif_rx status %d\n", status);
+}
+EXPORT_SYMBOL_GPL(usbnet_skb_return);
+/*-------------------------------------------------------------------------
+ *
+ * Network Device Driver (peer link to "Host Device", from USB host)
+ *
+ *-------------------------------------------------------------------------*/
+
+int  usbnet_change_mtu (struct net_device *net, int new_mtu)
+{
+	struct usbnet	*dev = netdev_priv(net);
+	int		ll_mtu = new_mtu + net->hard_header_len;
+	int		old_hard_mtu = dev->hard_mtu;
+	int		old_rx_urb_size = dev->rx_urb_size;
+
+	if (new_mtu <= 0)
+		return -EINVAL;
+	// no second zero-length packet read wanted after mtu-sized packets
+	if ((ll_mtu % dev->maxpacket) == 0)
+		return -EDOM;
+	net->mtu = new_mtu;
+
+	dev->hard_mtu = net->mtu + net->hard_header_len;
+	if (dev->rx_urb_size == old_hard_mtu) {
+		dev->rx_urb_size = dev->hard_mtu;
+		if (dev->rx_urb_size > old_rx_urb_size)
+			usbnet_unlink_rx_urbs(dev);
+	}
+
+	return 0;
+}
+
+/* The caller must hold list->lock */
+static void __usbnet_queue_skb(struct sk_buff_head *list,
+			struct sk_buff *newsk, enum skb_state state)
+{
+	struct skb_data *entry = (struct skb_data *) newsk->cb;
+
+	__skb_queue_tail(list, newsk);
+	entry->state = state;
+}
+
+/*-------------------------------------------------------------------------*/
+/*
+ * __skb_unlink() : remove sk_buff from list. _Must_ be called atomically, and with
+ * the list known..
+ */
+/* some LK 2.4 HCDs oopsed if we freed or resubmitted urbs from
+ * completion callbacks.  2.5 should have fixed those bugs...
+ */
+static enum skb_state defer_bh(struct usbnet *dev, struct sk_buff *skb,
+		struct sk_buff_head *list, enum skb_state state)
+{
+	unsigned long		flags;
+	enum skb_state 		old_state;
+	struct skb_data *entry = (struct skb_data *) skb->cb;
+
+	spin_lock_irqsave(&list->lock, flags);
+	old_state = entry->state;
+	entry->state = state;
+	__skb_unlink(skb, list);
+	spin_unlock(&list->lock);
+	spin_lock(&dev->done.lock);
+	__skb_queue_tail(&dev->done, skb);
+	if (dev->done.qlen == 1)
+		tasklet_schedule(&dev->bh);
+	spin_unlock_irqrestore(&dev->done.lock, flags);
+	return old_state;	
+} 
 
 /* some work can't be done in tasklets, so we use keventd
  *
